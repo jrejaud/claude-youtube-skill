@@ -54,6 +54,7 @@ Restart Claude Code. The skill triggers on its own whenever you mention YouTube 
 | `yt-frames` | YouTube's own auto-extracted frames, no key, no download |
 | `youtube-vision` | Gemini watches the video: `ask`, `summarize`, `key-moments` |
 | `yt-show` | Download with yt-dlp and play locally in mpv — no youtube.com, no ads |
+| `yt-grid.sh` | Thumbnail grid of the results (DeArrow thumbnails): browser contact sheet, or inline in iTerm2/kitty/WezTerm |
 | `yt-browse.sh` | fzf picker with thumbnail previews (iTerm2) |
 
 `SKILL.md` is the part Claude reads: when to fire, the exact workflow, the result format, and a

@@ -37,7 +37,14 @@ Everything else (Return YouTube Dislike, DeArrow, SponsorBlock, YouTube's own fr
    ```bash
    scripts/yt-slop.sh CHANNEL_ID [CHANNEL_ID ...]   # JSONL {channel_id, flag, reasons, ...}
    ```
-5. **Present** in the table below. Optionally open the interactive picker (step 6).
+5. **Present** in the table below, and **show the thumbnails**: write a TSV
+   (`videoId num title channel views approval duration age`, approval = integer percent or `-`,
+   same numbers as the table) and run
+   ```bash
+   scripts/yt-grid.sh --tsv results.tsv            # contact sheet in the browser, DeArrow thumbnails
+   scripts/yt-grid.sh --tsv results.tsv --inline   # inline in iTerm2 / kitty / WezTerm instead
+   ```
+   When the user picks one ("play 3"), use `scripts/yt-show <id>` (see Playback).
 6. *(Opt-in, needs a real TTY + fzf)* `scripts/yt-browse.sh --tsv results.tsv` — fzf list on the
    left, DeArrow thumbnail + metadata preview on the right (iTerm2 `imgcat`), Enter plays it.
    TSV columns: `videoId num title channel views approval duration`.

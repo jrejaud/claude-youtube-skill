@@ -11,12 +11,12 @@ if [ $# -eq 0 ]; then
 fi
 
 # Fetch RYD data in parallel
-ryd_data=$(printf '%s\n' "$@" | xargs -P 10 -I{} sh -c \
-  'curl -s "https://returnyoutubedislikeapi.com/votes?videoId={}" 2>/dev/null | jq -c "{id: .id, likes: .likes, dislikes: .dislikes}" 2>/dev/null || echo "{\"id\":\"{}\",\"likes\":null,\"dislikes\":null}"')
+ryd_data=$(printf '%s\n' "$@" | xargs -P 10 -n 1 sh -c \
+  'curl -s "https://returnyoutubedislikeapi.com/votes?videoId=$1" 2>/dev/null | jq -c "{id: .id, likes: .likes, dislikes: .dislikes}" 2>/dev/null || echo "{\"id\":\"$1\",\"likes\":null,\"dislikes\":null}"' _)
 
 # Fetch DeArrow data in parallel
-dearrow_data=$(printf '%s\n' "$@" | xargs -P 10 -I{} sh -c \
-  'title=$(curl -s "https://sponsor.ajay.app/api/branding?videoID={}" 2>/dev/null | jq -r ".titles[]? | select(.original == false) | .title" 2>/dev/null | head -1); if [ -n "$title" ]; then echo "{}|$title"; fi')
+dearrow_data=$(printf '%s\n' "$@" | xargs -P 10 -n 1 sh -c \
+  'title=$(curl -s "https://sponsor.ajay.app/api/branding?videoID=$1" 2>/dev/null | jq -r ".titles[]? | select(.original == false) | .title" 2>/dev/null | head -1); if [ -n "$title" ]; then echo "$1|$title"; fi' _)
 
 # Merge: output RYD data with DeArrow titles appended
 echo "$ryd_data" | while IFS= read -r line; do

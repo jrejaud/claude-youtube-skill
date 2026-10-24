@@ -86,9 +86,13 @@ dearrow_thumb() {
     if [[ "$code" == 200 && -s "$out" ]]; then echo "frame@${t}s" >&2; return 0; fi
   fi
 
-  # 3) YouTube fallback
-  if curl -sL --max-time 15 -o "$out" "https://i.ytimg.com/vi/${vid}/mqdefault.jpg" 2>/dev/null && [[ -s "$out" ]]; then
-    echo "yt-fallback" >&2; return 0
-  fi
+  # 3) YouTube fallback — maxresdefault (1280x720) first, mqdefault (320px) only for
+  # videos with no HD upload. -f makes the 404 fall through to the next size.
+  local name
+  for name in maxresdefault mqdefault; do
+    if curl -sfL --max-time 15 -o "$out" "https://i.ytimg.com/vi/${vid}/${name}.jpg" 2>/dev/null && [[ -s "$out" ]]; then
+      echo "yt-fallback:${name}" >&2; return 0
+    fi
+  done
   return 1
 }

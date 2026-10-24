@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# yt-show — download a YouTube video to a local file and play it. No youtube.com page, no ads.
+#
+#   yt-show <youtube-url|videoId> [--height 720] [--volume 40] [--no-play]
+#
+# YouTube serves video-only + audio-only streams; a single `-f best[...]` fails
+# ("Requested format is not available"), so this merges bv*+ba into mp4 (needs ffmpeg).
+# Files are cached under $YT_SHOW_CACHE (default ~/.cache/yt-show) and pruned after 7 days.
+# Prints the local file path on stdout.
+set -euo pipefail
+
+VOL="40"; H="720"; URL=""; PLAY=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --volume) VOL="$2"; shift ;;
+    --height) H="$2"; shift ;;
+    --no-play) PLAY=0 ;;
+    -*) echo "yt-show: unknown flag $1" >&2; exit 2 ;;
+    *) URL="$1" ;;
+  esac
+  shift
+done
+[[ -n "$URL" ]] || { echo "usage: yt-show <youtube-url|videoId> [--height H] [--volume V] [--no-play]" >&2; exit 2; }
+[[ "$URL" == http* ]] || URL="https://www.youtube.com/watch?v=$URL"
+
+CACHE="${YT_SHOW_CACHE:-$HOME/.cache/yt-show}"; mkdir -p "$CACHE"
+ID="$(yt-dlp --no-playlist --print id "$URL" 2>/dev/null | head -1)"
+[[ -n "$ID" ]] || { echo "yt-show: could not resolve a video id from $URL" >&2; exit 1; }
+FILE="$CACHE/$ID.mp4"
+
+if [[ ! -s "$FILE" ]]; then
+  yt-dlp --no-playlist -q --no-warnings \
+    -f "bv*[height<=$H][ext=mp4]+ba[ext=m4a]/bv*[height<=$H]+ba/b[height<=$H]/b" \
+    --merge-output-format mp4 -o "$CACHE/$ID.%(ext)s" "$URL" >&2
+fi
+[[ -s "$FILE" ]] || { echo "yt-show: download failed for $URL" >&2; exit 1; }
+
+# keep the cache bounded: drop files untouched for 7 days
+find "$CACHE" -type f -mtime +7 -delete 2>/dev/null || true
+
+echo "$FILE"
+(( PLAY )) || exit 0
+nohup mpv --force-window=immediate --no-resume-playback --volume="$VOL" "$FILE" >/dev/null 2>&1 &

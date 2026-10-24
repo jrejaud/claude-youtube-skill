@@ -1,0 +1,527 @@
+#!/usr/bin/env bash
+# youtube — read-only CLI for the YouTube Data API v3.
+# Targets the YouTube Data API v3 (read-only, API key auth).
+# https://developers.google.com/youtube/v3/docs
+set -euo pipefail
+
+# Keys come from the environment, or from an optional env file (KEY=value lines).
+ENV_FILE="${YT_SKILL_ENV:-$HOME/.config/claude-youtube/env}"
+# shellcheck disable=SC1090
+[[ -n "${YOUTUBE_API_KEY:-}" || ! -f "$ENV_FILE" ]] || { set -a; source "$ENV_FILE"; set +a; }
+
+: "${YOUTUBE_API_KEY:?YOUTUBE_API_KEY not set (export it or put it in $ENV_FILE)}"
+
+BASE="${YOUTUBE_BASE_URL:-https://www.googleapis.com/youtube/v3}"
+
+usage() {
+  cat <<EOF
+Usage: youtube <command> [args]
+
+Commands:
+  search-videos <q> [--limit N] [--type video|channel|playlist] [--order ORDER]
+                [--event-type live|completed|upcoming] [--duration short|medium|long]
+                [--channel <id|@handle>] [--published-after <RFC3339>]
+                [--published-before <RFC3339>] [--region <CC>] [--lang <code>]
+                                  Search YouTube. ORDER: relevance|date|rating|viewCount|title
+                                  --event-type live is the only way to find a broadcast
+                                  that is actually on air; searching for the word "live"
+                                  returns ordinary uploads whose titles contain it.
+                                  --event-type and --duration imply --type video.
+  video <id>                      Video details (snippet, contentDetails, statistics)
+  videos <id1,id2,...>            Batch video details (contentDetails, statistics) for
+                                  up to 50 IDs — comma-separated or space-separated args.
+                                  Use for duration/views/likes across a result set.
+  channel <id>                    Channel info (basic snippet)
+  channel-details <id>            Channel + analytics + branding + topic
+  channels <id1,id2,...>          Batch channel details (snippet, statistics, contentDetails)
+                                  for up to 50 channel IDs — one API unit for the lot.
+                                  Use when auditing a whole subscription list.
+  channel-latest <id1,id2,...>    Last-upload date + title per channel, batched. The
+                                  activity signal for pruning subscriptions: a channel
+                                  that has not posted in years is an obvious cut.
+  channel-videos <id> [--limit N] List videos uploaded by a channel
+  channel-playlists <id> [--limit N]
+                                  Playlists owned by a channel
+  playlist <id>                   Playlist details
+  playlist-items <id> [--limit N] Items in a playlist
+  comments <video-id> [--limit N] [--order ORDER] [--search T] [--lines]
+                                  Comment threads. ORDER: time|relevance; --search = searchTerms; --lines = 1 JSON line/comment
+  search-comments <query> [--videos N] [--match T] [--limit N] [--order date|relevance|viewCount]
+                                  Search videos (100 units) then pull their comment threads as JSON lines
+  captions <video-id>             Caption tracks metadata
+  transcript <video-id> [--lang LANG]
+                                  Pull captions text via youtube-transcript-api fallback
+  categories [--region US|JP|GB]  Video categories for a region
+  trending [--region US|JP|GB] [--limit N]
+                                  Most-popular videos in a region
+  engagement <video-id>           views / likes / comments + engagement-rate analysis
+
+  raw <path> [-G --data-urlencode k=v ...]
+                                  Raw GET against API v3 base. key= is auto-appended.
+
+ID inputs:
+  Most commands accept a raw ID or a youtube.com/youtu.be URL — IDs are
+  extracted automatically.
+
+Auth:
+  YOUTUBE_API_KEY (Data API v3, read-only). Get one at
+  https://console.cloud.google.com/apis/credentials
+EOF
+}
+
+# One JSON line per comment (top-level + inline replies).
+COMMENT_LINES='.items[] | .snippet as $t | ([$t.topLevelComment] + (.replies.comments // [])) | .[]
+  | {comment_id: .id, thread_id: ($t.topLevelComment.id), is_reply: (.snippet.parentId != null),
+     video_id: (.snippet.videoId // $t.videoId), url: "https://www.youtube.com/watch?v=\(.snippet.videoId // $t.videoId)&lc=\(.id)",
+     author: .snippet.authorDisplayName, author_channel: .snippet.authorChannelId.value, text: .snippet.textOriginal,
+     likes: .snippet.likeCount, replies: (if .snippet.parentId then null else $t.totalReplyCount end), published: .snippet.publishedAt}'
+
+# ---- helpers ----------------------------------------------------------------
+
+req() {
+  # req <path> [extra curl args...] — appends API key, follows redirects
+  local path="$1"; shift
+  local url="${BASE}${path}"
+  local sep="?"
+  [[ "$path" == *\?* ]] && sep="&"
+  curl -fsSL -G "$@" --data-urlencode "key=${YOUTUBE_API_KEY}" "${url}"
+}
+
+# Extract a video ID from a URL or pass through a bare ID.
+extract_video_id() {
+  local v="$1"
+  case "$v" in
+    *youtube.com/watch*v=*) v="${v#*v=}"; v="${v%%&*}" ;;
+    *youtu.be/*)            v="${v#*youtu.be/}"; v="${v%%\?*}"; v="${v%%&*}" ;;
+    *youtube.com/shorts/*)  v="${v#*shorts/}"; v="${v%%\?*}"; v="${v%%&*}" ;;
+    *youtube.com/embed/*)   v="${v#*embed/}"; v="${v%%\?*}"; v="${v%%&*}" ;;
+  esac
+  printf '%s' "$v"
+}
+
+extract_playlist_id() {
+  local v="$1"
+  case "$v" in
+    *list=*) v="${v#*list=}"; v="${v%%&*}" ;;
+  esac
+  printf '%s' "$v"
+}
+
+# Resolve a channel input (URL, @handle, or ID) to a UC... channel ID.
+resolve_channel_id() {
+  local v="$1"
+  case "$v" in
+    UC*) printf '%s' "$v"; return ;;
+    *youtube.com/channel/*) v="${v#*channel/}"; v="${v%%/*}"; v="${v%%\?*}"; printf '%s' "$v"; return ;;
+    *youtube.com/@*) v="${v#*@}"; v="${v%%/*}"; v="${v%%\?*}"; v="@${v}" ;;
+    @*) ;;
+    *youtube.com/c/*) v="${v#*c/}"; v="${v%%/*}"; v="${v%%\?*}" ;;
+    *youtube.com/user/*) v="${v#*user/}"; v="${v%%/*}"; v="${v%%\?*}" ;;
+  esac
+  # Try handle first if it starts with @, then forUsername, then search fallback.
+  local id=""
+  if [[ "$v" == @* ]]; then
+    id=$(req "/channels" --data-urlencode "part=id" --data-urlencode "forHandle=${v}" | jq -r '.items[0].id // empty')
+  fi
+  if [[ -z "$id" ]]; then
+    id=$(req "/channels" --data-urlencode "part=id" --data-urlencode "forUsername=${v#@}" | jq -r '.items[0].id // empty')
+  fi
+  if [[ -z "$id" ]]; then
+    id=$(req "/search" --data-urlencode "part=id" --data-urlencode "type=channel" --data-urlencode "q=${v#@}" --data-urlencode "maxResults=1" | jq -r '.items[0].id.channelId // empty')
+  fi
+  [[ -z "$id" ]] && { echo "could not resolve channel: $1" >&2; exit 1; }
+  printf '%s' "$id"
+}
+
+# Flatten comma- and space-separated channel arguments into one `id=` list, resolving
+# handles/URLs but leaving bare UC… ids alone (each resolution costs its own API call,
+# which is exactly what a batch verb is there to avoid). Enforces the API's cap of 50.
+collect_channel_ids() {
+  local ids="" n=0 raw p id
+  for raw in "$@"; do
+    IFS=',' read -ra parts <<< "$raw"
+    for p in "${parts[@]}"; do
+      [[ -z "$p" ]] && continue
+      if [[ "$p" == UC* && ${#p} -eq 24 ]]; then id="$p"; else id=$(resolve_channel_id "$p"); fi
+      ids="${ids:+${ids},}${id}"
+      n=$((n+1))
+    done
+  done
+  [[ $n -le 50 ]] || { echo "youtube: $n channel ids given, the API caps a batch at 50" >&2; return 2; }
+  printf '%s' "$ids"
+}
+
+# Channel uploads playlist ID (UU...).
+uploads_playlist_id() {
+  local cid="$1"
+  req "/channels" --data-urlencode "part=contentDetails" --data-urlencode "id=${cid}" \
+    | jq -r '.items[0].contentDetails.relatedPlaylists.uploads // empty'
+}
+
+# ---- commands ---------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  ""|-h|--help|help) usage ;;
+
+  search-videos)
+    q="${1:?usage: youtube search-videos <q> [--limit N] [--type ...] [--order ...]
+                [--event-type live|completed|upcoming] [--duration short|medium|long]
+                [--channel <id|@handle>] [--published-after <RFC3339>]
+                [--published-before <RFC3339>] [--region <CC>] [--lang <code>]}"
+    shift
+    limit=10
+    type="video"
+    order="relevance"
+    # Optional filters, sent only when set: the API rejects an empty value for each
+    # of these, so they cannot simply be passed through unconditionally.
+    event_type=""; duration=""; channel=""
+    after=""; before=""; region=""; lang=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit)            limit="$2"; shift 2 ;;
+        --type)             type="$2"; shift 2 ;;
+        --order)            order="$2"; shift 2 ;;
+        --event-type)       event_type="$2"; shift 2 ;;
+        --duration)         duration="$2"; shift 2 ;;
+        --channel)          channel="$2"; shift 2 ;;
+        --published-after)  after="$2"; shift 2 ;;
+        --published-before) before="$2"; shift 2 ;;
+        --region)           region="$2"; shift 2 ;;
+        --lang)             lang="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    # eventType is what makes "find me a live stream" answerable at all: without it
+    # the ranker just returns ordinary uploads whose titles contain the word "live".
+    # Both it and videoDuration are only legal alongside type=video, so imply that
+    # rather than handing back an API error the caller has to decode.
+    if [[ -n "$event_type" || -n "$duration" ]]; then type="video"; fi
+    args=(
+      --data-urlencode "part=id,snippet"
+      --data-urlencode "q=${q}"
+      --data-urlencode "type=${type}"
+      --data-urlencode "order=${order}"
+      --data-urlencode "maxResults=${limit}"
+      --data-urlencode "safeSearch=moderate"
+    )
+    if [[ -n "$event_type" ]]; then args+=(--data-urlencode "eventType=${event_type}"); fi
+    if [[ -n "$duration" ]];   then args+=(--data-urlencode "videoDuration=${duration}"); fi
+    if [[ -n "$channel" ]];    then args+=(--data-urlencode "channelId=$(resolve_channel_id "$channel")"); fi
+    if [[ -n "$after" ]];      then args+=(--data-urlencode "publishedAfter=${after}"); fi
+    if [[ -n "$before" ]];     then args+=(--data-urlencode "publishedBefore=${before}"); fi
+    if [[ -n "$region" ]];     then args+=(--data-urlencode "regionCode=${region}"); fi
+    if [[ -n "$lang" ]];       then args+=(--data-urlencode "relevanceLanguage=${lang}"); fi
+    req "/search" "${args[@]}" | jq '.'
+    ;;
+
+  video)
+    raw="${1:?usage: youtube video <id-or-url>}"
+    id=$(extract_video_id "$raw")
+    req "/videos" \
+      --data-urlencode "part=snippet,contentDetails,statistics,status,topicDetails" \
+      --data-urlencode "id=${id}" \
+      | jq '.'
+    ;;
+
+  videos)
+    [[ $# -ge 1 ]] || { echo "usage: youtube videos <id1,id2,...> [id3 ...]" >&2; exit 2; }
+    # Accept comma-separated in one arg, space-separated across args, or a mix.
+    ids=""
+    for raw in "$@"; do
+      IFS=',' read -ra parts <<< "$raw"
+      for p in "${parts[@]}"; do
+        [[ -z "$p" ]] && continue
+        id=$(extract_video_id "$p")
+        ids="${ids:+${ids},}${id}"
+      done
+    done
+    req "/videos" \
+      --data-urlencode "part=snippet,contentDetails,statistics" \
+      --data-urlencode "id=${ids}" \
+      | jq '.'
+    ;;
+
+  channel)
+    raw="${1:?usage: youtube channel <id-or-url-or-@handle>}"
+    cid=$(resolve_channel_id "$raw")
+    req "/channels" \
+      --data-urlencode "part=snippet,statistics" \
+      --data-urlencode "id=${cid}" \
+      | jq '.'
+    ;;
+
+  channel-details)
+    raw="${1:?usage: youtube channel-details <id-or-url-or-@handle>}"
+    cid=$(resolve_channel_id "$raw")
+    req "/channels" \
+      --data-urlencode "part=snippet,statistics,contentDetails,brandingSettings,topicDetails,status" \
+      --data-urlencode "id=${cid}" \
+      | jq '.'
+    ;;
+
+  channels)
+    # Batch sibling of `channel-details`, for auditing a whole subscription list:
+    # one API unit per 50 channels instead of one call per channel.
+    [[ $# -ge 1 ]] || { echo "usage: youtube channels <id1,id2,...> [id3 ...]  (max 50)" >&2; exit 2; }
+    ids=$(collect_channel_ids "$@") || exit 2
+    req "/channels" \
+      --data-urlencode "part=snippet,statistics,contentDetails" \
+      --data-urlencode "id=${ids}" \
+      | jq '.'
+    ;;
+
+  channel-latest)
+    # The pruning signal: when did each channel last upload? Two batched calls per 50
+    # channels (channels -> uploads playlist ids, then one playlistItems call each),
+    # emitting one TSV row per channel so it pipes straight into sort/awk.
+    [[ $# -ge 1 ]] || { echo "usage: youtube channel-latest <id1,id2,...> [id3 ...]  (max 50)" >&2; exit 2; }
+    ids=$(collect_channel_ids "$@") || exit 2
+    meta=$(req "/channels" \
+      --data-urlencode "part=snippet,contentDetails" \
+      --data-urlencode "id=${ids}")
+    printf 'channel_id\tlast_upload\ttitle\tlatest_video\n'
+    # Read the channel list on fd 3, not stdin: the curl inside the loop body would
+    # otherwise swallow the remaining lines and silently drop most of the batch.
+    while IFS=$'\t' read -r -u 3 cid cname upl; do
+      [[ -z "$upl" ]] && { printf '%s\t%s\t%s\t%s\n' "$cid" "NO_UPLOADS" "$cname" ""; continue; }
+      item=$(req "/playlistItems" \
+        --data-urlencode "part=snippet" \
+        --data-urlencode "playlistId=${upl}" \
+        --data-urlencode "maxResults=1" \
+        | jq -r '.items[0] | if . == null then "NONE\t" else
+                   ((.contentDetails.videoPublishedAt // .snippet.publishedAt) + "\t" + .snippet.title) end')
+      printf '%s\t%s\t%s\t%s\n' "$cid" "${item%%$'\t'*}" "$cname" "${item#*$'\t'}"
+    done 3< <(jq -r '.items[] | [.id, .snippet.title, (.contentDetails.relatedPlaylists.uploads // "")] | @tsv' <<< "$meta")
+    ;;
+
+  channel-videos)
+    raw="${1:?usage: youtube channel-videos <id-or-url-or-@handle> [--limit N]}"
+    shift
+    limit=10
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit) limit="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    cid=$(resolve_channel_id "$raw")
+    upl=$(uploads_playlist_id "$cid")
+    [[ -z "$upl" ]] && { echo "no uploads playlist for $cid" >&2; exit 1; }
+    req "/playlistItems" \
+      --data-urlencode "part=snippet,contentDetails" \
+      --data-urlencode "playlistId=${upl}" \
+      --data-urlencode "maxResults=${limit}" \
+      | jq '.'
+    ;;
+
+  channel-playlists)
+    raw="${1:?usage: youtube channel-playlists <id-or-url-or-@handle> [--limit N]}"
+    shift
+    limit=10
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit) limit="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    cid=$(resolve_channel_id "$raw")
+    req "/playlists" \
+      --data-urlencode "part=snippet,contentDetails,status" \
+      --data-urlencode "channelId=${cid}" \
+      --data-urlencode "maxResults=${limit}" \
+      | jq '.'
+    ;;
+
+  playlist)
+    raw="${1:?usage: youtube playlist <id-or-url>}"
+    pid=$(extract_playlist_id "$raw")
+    req "/playlists" \
+      --data-urlencode "part=snippet,contentDetails,status" \
+      --data-urlencode "id=${pid}" \
+      | jq '.'
+    ;;
+
+  playlist-items)
+    raw="${1:?usage: youtube playlist-items <id-or-url> [--limit N]}"
+    shift
+    limit=10
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit) limit="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    pid=$(extract_playlist_id "$raw")
+    req "/playlistItems" \
+      --data-urlencode "part=snippet,contentDetails" \
+      --data-urlencode "playlistId=${pid}" \
+      --data-urlencode "maxResults=${limit}" \
+      | jq '.'
+    ;;
+
+  comments)
+    raw="${1:?usage: youtube comments <video-id-or-url> [--limit N] [--order time|relevance] [--search T] [--lines]}"
+    shift
+    limit=20
+    order="relevance"
+    search=""
+    lines=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --limit) limit="$2"; shift 2 ;;
+        --order) order="$2"; shift 2 ;;
+        --search) search="$2"; shift 2 ;;
+        --lines) lines=1; shift ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    vid=$(extract_video_id "$raw")
+    args=(--data-urlencode "part=snippet,replies" --data-urlencode "videoId=${vid}"
+          --data-urlencode "order=${order}" --data-urlencode "maxResults=${limit}" --data-urlencode "textFormat=plainText")
+    # searchTerms with order=relevance is a 400 from the API; time is the only order it accepts.
+    [[ -n "$search" ]] && args=("${args[@]/order=relevance/order=time}")
+    [[ -n "$search" ]] && args+=(--data-urlencode "searchTerms=${search}")
+    if [[ $lines == 1 ]]; then req "/commentThreads" "${args[@]}" | jq -c "$COMMENT_LINES"
+    else req "/commentThreads" "${args[@]}" | jq '.'; fi
+    ;;
+
+  search-comments)
+    # Discovery: search.list (100 units) for videos, then commentThreads per video (1 unit each), JSON lines.
+    q="${1:?usage: youtube search-comments <query> [--videos N] [--match T] [--limit N] [--order date|relevance|viewCount]}"
+    shift
+    nvid=5; match=""; limit=20; vorder="relevance"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --videos) nvid="$2"; shift 2 ;;
+        --match) match="$2"; shift 2 ;;
+        --limit) limit="$2"; shift 2 ;;
+        --order) vorder="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    vids=$(req "/search" --data-urlencode "part=snippet" --data-urlencode "type=video" --data-urlencode "q=${q}" \
+             --data-urlencode "order=${vorder}" --data-urlencode "maxResults=${nvid}" | jq -r '.items[].id.videoId')
+    for vid in $vids; do
+      args=(--data-urlencode "part=snippet,replies" --data-urlencode "videoId=${vid}" --data-urlencode "order=$([[ -n "$match" ]] && echo time || echo relevance)"
+            --data-urlencode "maxResults=${limit}" --data-urlencode "textFormat=plainText")
+      [[ -n "$match" ]] && args+=(--data-urlencode "searchTerms=${match}")
+      # Comments disabled on a video → 403; skip it rather than abort the sweep.
+      out=$(req "/commentThreads" "${args[@]}" 2>/dev/null) || { echo "skip ${vid}: comments unavailable" >&2; continue; }
+      jq -c "$COMMENT_LINES" <<<"$out"
+    done
+    ;;
+
+  captions)
+    raw="${1:?usage: youtube captions <video-id-or-url>}"
+    vid=$(extract_video_id "$raw")
+    req "/captions" \
+      --data-urlencode "part=snippet" \
+      --data-urlencode "videoId=${vid}" \
+      | jq '.'
+    ;;
+
+  transcript)
+    raw="${1:?usage: youtube transcript <video-id-or-url> [--lang LANG]}"
+    shift
+    lang="en"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --lang) lang="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    vid=$(extract_video_id "$raw")
+    # The Data API /captions/{id} returns the binary track but only to the
+    # video owner (OAuth-required). The standard read-only path is the
+    # public timedtext endpoint, which serves SRT/SBV for many videos.
+    out=$(curl -fsSL -G \
+      --data-urlencode "v=${vid}" \
+      --data-urlencode "lang=${lang}" \
+      --data-urlencode "fmt=srv3" \
+      "https://video.google.com/timedtext" || true)
+    if [[ -z "$out" ]]; then
+      echo "no transcript available for ${vid} (lang=${lang}). Try a different --lang, or use youtube-vision to have Gemini watch the video instead." >&2
+      exit 1
+    fi
+    printf '%s\n' "$out"
+    ;;
+
+  categories)
+    region="US"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --region) region="$2"; shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    req "/videoCategories" \
+      --data-urlencode "part=snippet" \
+      --data-urlencode "regionCode=${region}" \
+      | jq '.'
+    ;;
+
+  trending)
+    region="US"
+    limit=10
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --region) region="$2"; shift 2 ;;
+        --limit)  limit="$2";  shift 2 ;;
+        *) echo "unknown flag: $1" >&2; exit 2 ;;
+      esac
+    done
+    req "/videos" \
+      --data-urlencode "part=snippet,contentDetails,statistics" \
+      --data-urlencode "chart=mostPopular" \
+      --data-urlencode "regionCode=${region}" \
+      --data-urlencode "maxResults=${limit}" \
+      | jq '.'
+    ;;
+
+  engagement)
+    raw="${1:?usage: youtube engagement <video-id-or-url>}"
+    vid=$(extract_video_id "$raw")
+    data=$(req "/videos" \
+      --data-urlencode "part=snippet,statistics" \
+      --data-urlencode "id=${vid}")
+    echo "$data" | jq '
+      .items[0] as $v
+      | ($v.statistics.viewCount    // "0" | tonumber) as $views
+      | ($v.statistics.likeCount    // "0" | tonumber) as $likes
+      | ($v.statistics.commentCount // "0" | tonumber) as $comments
+      | {
+          title: $v.snippet.title,
+          channel: $v.snippet.channelTitle,
+          publishedAt: $v.snippet.publishedAt,
+          views: $views,
+          likes: $likes,
+          comments: $comments,
+          likeRate:    (if $views > 0 then ($likes    / $views * 100 | .*100 | round / 100) else null end),
+          commentRate: (if $views > 0 then ($comments / $views * 100 | .*100 | round / 100) else null end),
+          engagement: (
+            if $views == 0 then "no views"
+            elif ($likes + $comments) / $views * 100 >= 5  then "excellent"
+            elif ($likes + $comments) / $views * 100 >= 2  then "good"
+            elif ($likes + $comments) / $views * 100 >= 1  then "average"
+            elif ($likes + $comments) / $views * 100 >= 0.5 then "below average"
+            else "low"
+            end
+          )
+        }
+    '
+    ;;
+
+  raw)
+    path="${1:?usage: youtube raw <path> [-G --data-urlencode k=v ...]}"
+    shift || true
+    req "$path" "$@" | jq '.'
+    ;;
+
+  *)
+    echo "unknown command: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

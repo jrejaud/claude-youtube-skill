@@ -1,0 +1,284 @@
+#!/usr/bin/env node
+// yt-frames — YouTube's own automatically-extracted video frames, without downloading video.
+//
+// Every YouTube upload is processed into three stored frames taken from roughly a quarter,
+// a half and three quarters of the way through, served from the public image host beside the
+// uploader's thumbnail:
+//
+//   https://i.ytimg.com/vi/<videoId>/hq1.jpg      (also hq2, hq3)
+//
+// A live broadcast has NONE of those (404) and serves hq720_live.jpg instead — which is NOT
+// a frame. It is the broadcaster's own thumbnail at 720p, so using it as a de-clickbaited
+// image replaces the clickbait with itself. --live/--wide fetch it for inspection only.
+//
+// Two traps, because this passed as working for two days (2026-09-27): RMSE against
+// hqdefault.jpg reads 0.28-0.40 and is ENTIRELY letterboxing (hqdefault is boxed into 4:3,
+// hq720_live is not), and an exact 0.000 between them is a tell rather than a pass — it
+// means that broadcaster set no custom thumbnail, the one case where this looks right.
+//
+// A real live frame has to be decoded from the stream:
+//   ffmpeg -i "<240p m3u8 from yt-dlp -J>" -frames:v 1 out.jpg    # ~3s, ~11KB
+//
+// These need no API key, no player request, no signature deciphering and no video decoding —
+// one plain HTTP GET each, a few KB. They are real frames, not crops of the uploader's
+// artwork: measured against hqdefault.jpg they differ by 0.28-0.34 normalised RMSE.
+//
+// That is what makes them the cheap answer to "show me what this video actually looks like",
+// which is the DeArrow question. The exact-timestamp alternative costs an extractor call plus
+// range reads into the video container — seconds per thumbnail instead of milliseconds.
+//
+// Exit codes: 0 ok · 1 no frames for this video · 2 bad usage · 3 network error
+
+import { writeFile } from 'node:fs/promises'
+
+const HOST = 'https://i.ytimg.com/vi'
+
+/** The three stored frames, plus the larger 16:9 live variant. */
+const VOD_VARIANTS = ['hq1', 'hq2', 'hq3']
+const LIVE_VARIANTS = ['hq1_live', 'hq2_live', 'hq3_live']
+/** Live only, and 16:9 natively rather than letterboxed into 4:3. */
+const LIVE_WIDE = 'hq720_live'
+
+const USAGE = `yt-frames — YouTube's auto-extracted video frames (no video download)
+
+Usage:
+  yt-frames list <videoId|url>              Which frames exist, with size and dimensions
+  yt-frames url  <videoId|url> [opts]       Print the chosen frame's URL
+  yt-frames get  <videoId|url> [opts]       Download the chosen frame
+
+Options:
+  --index 1|2|3     Which stored frame. Default: chosen from the video id (see --seeded).
+  --seeded          Pick the index from a hash of the video id: arbitrary but stable, so one
+                    video always gets the same frame. This is the default.
+  --live            Force the live variants (hqN_live.jpg). Default is to try the normal ones
+                    and fall back to live automatically.
+  --wide            Live only: hq720_live.jpg, which is 16:9 with no letterboxing.
+  --out FILE        Where to write (get). Default: <videoId>-<variant>.jpg
+  --json            Machine-readable output.
+
+Notes:
+  A video id may be given bare or as any YouTube URL.
+  'list' costs one HEAD per variant; 'get' costs one GET.
+`
+
+function fail(msg, code) {
+  process.stderr.write(`yt-frames: ${msg}\n`)
+  process.exit(code)
+}
+
+/** Accepts a bare id or any of the YouTube URL shapes. */
+function extractVideoId(input) {
+  const patterns = [
+    /[?&]v=([A-Za-z0-9_-]{11})/,
+    /youtu\.be\/([A-Za-z0-9_-]{11})/,
+    /\/shorts\/([A-Za-z0-9_-]{11})/,
+    /\/embed\/([A-Za-z0-9_-]{11})/,
+    /\/live\/([A-Za-z0-9_-]{11})/,
+  ]
+  for (const p of patterns) {
+    const m = input.match(p)
+    if (m) return m[1]
+  }
+  if (/^[A-Za-z0-9_-]{11}$/.test(input)) return input
+  return null
+}
+
+// Alea, the seeded generator the DeArrow server uses to pick a timestamp. Ported here so a
+// frame chosen by this script matches the one the Android client chooses for the same video.
+function alea(seed) {
+  let n = 0xefc8249d
+  const mash = (data) => {
+    for (let i = 0; i < data.length; i++) {
+      n += data.charCodeAt(i)
+      let h = 0.02519603282416938 * n
+      n = h >>> 0
+      h -= n
+      h *= n
+      n = h >>> 0
+      h -= n
+      n += h * 0x100000000
+    }
+    return (n >>> 0) * 2.3283064365386963e-10
+  }
+  let s0 = mash(' ')
+  let s1 = mash(' ')
+  let s2 = mash(' ')
+  let c = 1
+  s0 -= mash(seed); if (s0 < 0) s0 += 1
+  s1 -= mash(seed); if (s1 < 0) s1 += 1
+  s2 -= mash(seed); if (s2 < 0) s2 += 1
+  return () => {
+    const t = 2091639 * s0 + c * 2.3283064365386963e-10
+    s0 = s1
+    s1 = s2
+    c = t | 0
+    s2 = t - c
+    return s2
+  }
+}
+
+function seededIndex(videoId, count) {
+  return Math.min(Math.floor(alea(videoId)() * count) + 1, count)
+}
+
+function variantsFor({ live, wide }) {
+  if (wide) return [LIVE_WIDE]
+  return live ? LIVE_VARIANTS : VOD_VARIANTS
+}
+
+const urlFor = (videoId, variant) => `${HOST}/${videoId}/${variant}.jpg`
+
+async function head(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', redirect: 'follow' })
+    return { ok: res.ok, status: res.status, bytes: Number(res.headers.get('content-length') || 0) }
+  } catch (e) {
+    fail(`could not reach ${new URL(url).host}: ${e.message}`, 3)
+  }
+}
+
+async function get(url) {
+  try {
+    const res = await fetch(url, { redirect: 'follow' })
+    if (!res.ok) return { ok: false, status: res.status }
+    return { ok: true, status: res.status, body: Buffer.from(await res.arrayBuffer()) }
+  } catch (e) {
+    fail(`could not reach ${new URL(url).host}: ${e.message}`, 3)
+  }
+}
+
+/**
+ * JPEG dimensions, read from the SOFn marker.
+ *
+ * Avoids shelling out to ImageMagick or sips just to report a width, which would make this
+ * script depend on a tool the caller may not have.
+ */
+function jpegSize(buf) {
+  let i = 2
+  while (i < buf.length - 9) {
+    if (buf[i] !== 0xff) { i++; continue }
+    const marker = buf[i + 1]
+    // SOF0..SOF15, excluding the non-frame markers DHT (c4), JPGA (c8) and DAC (cc).
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+      return { height: buf.readUInt16BE(i + 5), width: buf.readUInt16BE(i + 7) }
+    }
+    i += 2 + buf.readUInt16BE(i + 2)
+  }
+  return null
+}
+
+async function cmdList(videoId, json) {
+  const rows = []
+  for (const variant of [...VOD_VARIANTS, ...LIVE_VARIANTS, LIVE_WIDE]) {
+    const url = urlFor(videoId, variant)
+    const r = await head(url)
+    // A missing frame is served as a 404 whose body is a 1097-byte placeholder image, so the
+    // status is the only reliable signal here — size alone would look like a valid tiny JPEG.
+    if (r.ok) rows.push({ variant, bytes: r.bytes, url })
+  }
+  if (rows.length === 0) {
+    if (json) process.stdout.write(JSON.stringify({ videoId, frames: [] }) + '\n')
+    else process.stderr.write(`yt-frames: no stored frames for ${videoId}\n`)
+    process.exit(1)
+  }
+  if (json) {
+    process.stdout.write(JSON.stringify({ videoId, live: rows.some(r => r.variant.endsWith('_live')), frames: rows }, null, 2) + '\n')
+    return
+  }
+  for (const r of rows) process.stdout.write(`${r.variant.padEnd(12)} ${String(r.bytes).padStart(7)}B  ${r.url}\n`)
+}
+
+/**
+ * Works out which variant to use.
+ *
+ * A bare video id does not say whether it is an upload or a broadcast, and the two are served
+ * differently: an upload has hq1/hq2/hq3, a live broadcast 404s on all of those and offers
+ * only hq720_live.jpg — a single frame of the current moment, which refreshes as the stream
+ * runs. (hq1_live..hq3_live exist too, but only as aliases of hq1..hq3 on an upload; they are
+ * absent on an actual broadcast, whatever yt-dlp's speculative listing suggests.) So the chain
+ * is: the three stored frames, then their aliases, then the live single frame.
+ */
+async function resolveVariant(videoId, opts) {
+  const tryLists = opts.wide
+    ? [[LIVE_WIDE]]
+    : opts.live
+      ? [LIVE_VARIANTS, [LIVE_WIDE]]
+      : [VOD_VARIANTS, LIVE_VARIANTS, [LIVE_WIDE]]
+  for (const list of tryLists) {
+    const index = list.length === 1 ? 1 : (opts.index ?? seededIndex(videoId, list.length))
+    const variant = list[Math.min(index, list.length) - 1]
+    const r = await head(urlFor(videoId, variant))
+    if (r.ok) return { variant, live: variant.endsWith('_live') }
+  }
+  return null
+}
+
+async function cmdUrl(videoId, opts) {
+  const picked = await resolveVariant(videoId, opts)
+  if (!picked) fail(`no stored frames for ${videoId}`, 1)
+  const url = urlFor(videoId, picked.variant)
+  if (opts.json) process.stdout.write(JSON.stringify({ videoId, ...picked, url }) + '\n')
+  else process.stdout.write(url + '\n')
+}
+
+async function cmdGet(videoId, opts) {
+  const picked = await resolveVariant(videoId, opts)
+  if (!picked) fail(`no stored frames for ${videoId}`, 1)
+  const url = urlFor(videoId, picked.variant)
+  const res = await get(url)
+  if (!res.ok) fail(`${url} returned HTTP ${res.status}`, 1)
+  const out = opts.out ?? `${videoId}-${picked.variant}.jpg`
+  await writeFile(out, res.body)
+  const size = jpegSize(res.body)
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ videoId, ...picked, url, path: out, bytes: res.body.length, ...size }) + '\n')
+  } else {
+    const dims = size ? `${size.width}x${size.height}` : 'unknown size'
+    process.stdout.write(`${out}  ${picked.variant}  ${dims}  ${res.body.length}B\n`)
+  }
+}
+
+function parseArgs(argv) {
+  const opts = { json: false, live: false, wide: false, index: null, out: null }
+  const rest = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    switch (a) {
+      case '--json': opts.json = true; break
+      case '--live': opts.live = true; break
+      case '--wide': opts.wide = true; opts.live = true; break
+      case '--seeded': opts.index = null; break
+      case '--index': {
+        const v = Number(argv[++i])
+        if (!Number.isInteger(v) || v < 1 || v > 3) fail('--index must be 1, 2 or 3', 2)
+        opts.index = v
+        break
+      }
+      case '--out': opts.out = argv[++i]; break
+      case '-h': case '--help': process.stdout.write(USAGE); process.exit(0)
+      default:
+        if (a.startsWith('-')) fail(`unknown flag: ${a}`, 2)
+        rest.push(a)
+    }
+  }
+  return { opts, rest }
+}
+
+const [cmd, ...argv] = process.argv.slice(2)
+if (!cmd || cmd === '-h' || cmd === '--help') {
+  process.stdout.write(USAGE)
+  process.exit(cmd ? 0 : 2)
+}
+
+const { opts, rest } = parseArgs(argv)
+const raw = rest[0]
+if (!raw) fail(`${cmd} needs a video id or URL`, 2)
+const videoId = extractVideoId(raw)
+if (!videoId) fail(`not a YouTube video id or URL: ${raw}`, 2)
+
+switch (cmd) {
+  case 'list': await cmdList(videoId, opts.json); break
+  case 'url': await cmdUrl(videoId, opts); break
+  case 'get': await cmdGet(videoId, opts); break
+  default: fail(`unknown command: ${cmd}`, 2)
+}

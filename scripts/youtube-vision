@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# youtube-vision — Gemini API wrapper for YouTube video analysis.
+# Auth: GEMINI_API_KEY from the environment or $YT_SKILL_ENV (default ~/.config/claude-youtube/env).
+set -uo pipefail
+
+ENV_FILE="${YT_SKILL_ENV:-$HOME/.config/claude-youtube/env}"
+[ -n "${GEMINI_API_KEY:-}" ] || [ ! -f "$ENV_FILE" ] || { set -a; . "$ENV_FILE"; set +a; }
+: "${GEMINI_API_KEY:?GEMINI_API_KEY not set (export it or put it in $ENV_FILE)}"
+
+BASE="https://generativelanguage.googleapis.com/v1beta"
+MODEL="${YOUTUBE_VISION_MODEL:-gemini-2.5-flash}"
+
+usage() {
+  cat <<EOF
+Usage: youtube-vision <command> [args]
+
+  ask <youtube-url> <question>     Ask a freeform question about a YouTube video
+  summarize <youtube-url>          Detailed summary of the video
+  key-moments <youtube-url>        Extract key moments with timestamps
+  list-models                      List available Gemini models
+  raw-ask <youtube-url> <prompt>   Like ask, but emits full JSON response
+
+Env:
+  GEMINI_API_KEY        required (https://aistudio.google.com/apikey)
+  YOUTUBE_VISION_MODEL  override model (default: gemini-2.5-flash)
+EOF
+}
+
+# generate <youtube-url> <prompt>
+# Builds a fileData+text generateContent request and prints just the text candidate.
+generate() {
+  local url="$1" prompt="$2"
+  local body
+  body=$(jq -n --arg url "$url" --arg prompt "$prompt" '{
+    contents: [{
+      parts: [
+        { fileData: { fileUri: $url } },
+        { text: $prompt }
+      ]
+    }]
+  }')
+  local response
+  response=$(curl -sS -X POST \
+    "$BASE/models/$MODEL:generateContent?key=$GEMINI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body")
+  local text
+  text=$(printf '%s' "$response" | jq -r '.candidates[0].content.parts[0].text // empty')
+  if [ -z "$text" ]; then
+    echo "Error: no text in response" >&2
+    printf '%s\n' "$response" >&2
+    return 1
+  fi
+  printf '%s\n' "$text"
+}
+
+# generate_raw <youtube-url> <prompt>
+generate_raw() {
+  local url="$1" prompt="$2"
+  local body
+  body=$(jq -n --arg url "$url" --arg prompt "$prompt" '{
+    contents: [{
+      parts: [
+        { fileData: { fileUri: $url } },
+        { text: $prompt }
+      ]
+    }]
+  }')
+  curl -sS -X POST \
+    "$BASE/models/$MODEL:generateContent?key=$GEMINI_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$body"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  ask)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    generate "$2" "$3"
+    ;;
+  summarize)
+    [ $# -ge 2 ] || { usage; exit 2; }
+    generate "$2" "Provide a detailed summary of this video. Cover the main topic, key points discussed, and overall structure."
+    ;;
+  key-moments)
+    [ $# -ge 2 ] || { usage; exit 2; }
+    generate "$2" "Extract the key moments from this video as a timestamped list. Format each entry as [MM:SS] short description of what happens at that moment."
+    ;;
+  list-models)
+    curl -sS "$BASE/models?key=$GEMINI_API_KEY" | jq '.'
+    ;;
+  raw-ask)
+    [ $# -ge 3 ] || { usage; exit 2; }
+    generate_raw "$2" "$3"
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    usage
+    exit 2
+    ;;
+esac

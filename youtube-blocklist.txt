@@ -1,0 +1,2 @@
+# YouTube channel blocklist — one channelId (UC...) or @handle per line. "#" = comment.
+# Add offenders with: yt-blocklist.sh add <channelId|@handle> [reason]

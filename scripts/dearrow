@@ -1,0 +1,240 @@
+#!/bin/bash
+# dearrow — CLI for the DeArrow crowdsourced branding API (sponsor.ajay.app).
+#
+# DeArrow replaces YouTube clickbait titles and thumbnails with community
+# submissions. This CLI is the read surface for that data: raw branding JSON,
+# the privacy-preserving hash-prefix lookup the browser extension actually uses,
+# the resolved title/thumbnail a client would display, and thumbnail download.
+#
+# Verbs:
+#   branding <videoId>            raw branding JSON for one video (leaks the ID)
+#   branding-hash <videoId>       hash-prefix lookup: fetch the 4-hex-char bucket,
+#                                 return the whole bucket (privacy-preserving) or
+#                                 just this video's entry with --only
+#   hash <videoId>                sha256 of the videoId, and its 4-char prefix
+#   title <videoId>               the title a DeArrow client would show, or empty
+#   thumbnail <videoId> [--out F] resolved thumbnail URL (or download with --out)
+#   resolve <videoId>             one-line JSON: {videoId,title,thumbnailUrl,source}
+#
+# Flags:
+#   --api-url URL   override the API base (default https://sponsor.ajay.app)
+#   --raw           print unformatted JSON exactly as the server returned it
+#   --only          (branding-hash) return only this videoId's entry
+#   --time N        (thumbnail) force a timestamp in seconds
+#   --generate      (thumbnail) ask the thumbnail server to render now
+#   --out PATH      (thumbnail) download to PATH instead of printing the URL
+#   -h|--help
+#
+# Exit: 0 ok · 1 no DeArrow data for this video · 2 bad usage · 3 network/API error
+set -euo pipefail
+
+API_URL="https://sponsor.ajay.app"
+THUMB_URL="https://dearrow-thumb.ajay.app/api/v1/getThumbnail"
+RAW=0; ONLY=0; GENERATE=0; FORCE_TIME=""; OUT=""
+
+die()   { echo "dearrow: $*" >&2; exit 2; }
+neterr(){ echo "dearrow: $*" >&2; exit 3; }
+
+usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need curl; need jq; need shasum
+
+# --- helpers ---------------------------------------------------------------
+
+# sha256 hex of a videoId (DeArrow hashes the raw ID, no salt)
+vid_sha256() {
+  local h
+  h=$(printf '%s' "$1" | shasum -a 256)
+  echo "${h%% *}"
+}
+
+_get() { # _get <url> -> body on stdout, exit 3 on transport/HTTP failure
+  local url="$1" body code tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/dearrow.XXXXXX")
+  code=$(curl -sS --max-time 25 -o "$tmp" -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+  body=$(cat "$tmp"); rm -f "$tmp"
+  case "$code" in
+    200) printf '%s' "$body" ;;
+    404) printf '' ;;                       # no data for this video — not an error
+    000) neterr "could not reach ${url%%\?*}" ;;
+    *)   neterr "HTTP $code from ${url%%\?*}" ;;
+  esac
+}
+
+_emit() { # pretty unless --raw
+  if [[ $RAW -eq 1 ]]; then cat; else jq .; fi
+}
+
+# Pick the title a DeArrow client would display from a branding object.
+# Rule (mirrors the extension): drop removed/downvoted titles, prefer locked,
+# then highest votes, then — arbitrarily but DETERMINISTICALLY — the largest
+# UUID, so two runs never disagree on an equal-vote tie. Empty = no replacement.
+_pick_title() {
+  jq -r '
+    (.titles // [])
+    | map(select((.removed // false) | not))
+    | map(select((.votes // 0) >= 0))
+    | sort_by([(if (.locked // false) then 1 else 0 end), (.votes // 0), (.UUID // "")])
+    | reverse
+    | .[0]
+    # A winning "original" submission is the community voting to KEEP the
+    # uploaders own title, so the answer is no replacement, not the runner-up.
+    | if . == null or (.original // false) then "" else (.title // "") end
+  '
+}
+
+# Pick the thumbnail timestamp: prefer a locked/most-voted community frame,
+# else the server-suggested randomTime, else empty (caller falls back).
+_pick_thumb_time() {
+  jq -r '
+    ((.thumbnails // [])
+      | map(select((.removed // false) | not))
+      | map(select((.votes // 0) >= 0))
+      | sort_by([(if (.locked // false) then 1 else 0 end), (.votes // 0), (.UUID // "")])
+      | reverse
+      | .[0]
+      # As with titles, a winning "original" submission means keep the
+      # uploaders thumbnail. Original entries also carry a null timestamp.
+      | if . == null or (.original // false) then empty else (.timestamp // empty) end)
+    // (.randomTime // empty)
+    // ""
+  '
+}
+
+_branding_json() { # <videoId> -> branding object ("" if none)
+  _get "${API_URL}/api/branding?videoID=$1"
+}
+
+# --- verbs -----------------------------------------------------------------
+
+cmd_hash() {
+  local vid="$1" h
+  h=$(vid_sha256 "$vid")
+  jq -n --arg v "$vid" --arg h "$h" --arg p "${h:0:4}" \
+     '{videoId:$v, sha256:$h, prefix:$p}' | _emit
+}
+
+cmd_branding() {
+  local vid="$1" body
+  body=$(_branding_json "$vid")
+  [[ -z "$body" ]] && { echo "dearrow: no branding data for $vid" >&2; exit 1; }
+  printf '%s' "$body" | _emit
+}
+
+cmd_branding_hash() {
+  local vid="$1" h body
+  h=$(vid_sha256 "$vid")
+  body=$(_get "${API_URL}/api/branding/${h:0:4}")
+  [[ -z "$body" || "$body" == "{}" ]] && { echo "dearrow: empty bucket ${h:0:4}" >&2; exit 1; }
+  if [[ $ONLY -eq 1 ]]; then
+    local entry
+    entry=$(printf '%s' "$body" | jq --arg v "$vid" '.[$v] // empty')
+    [[ -z "$entry" ]] && { echo "dearrow: $vid not in bucket ${h:0:4}" >&2; exit 1; }
+    printf '%s' "$entry" | _emit
+  else
+    printf '%s' "$body" | _emit
+  fi
+}
+
+cmd_title() {
+  local vid="$1" body title
+  body=$(_branding_json "$vid")
+  [[ -z "$body" ]] && exit 1
+  title=$(printf '%s' "$body" | _pick_title)
+  [[ -z "$title" ]] && exit 1
+  printf '%s\n' "$title"
+}
+
+cmd_thumbnail() {
+  local vid="$1" body t url
+  if [[ -n "$FORCE_TIME" ]]; then
+    t="$FORCE_TIME"
+  else
+    body=$(_branding_json "$vid")
+    t=$(printf '%s' "${body:-{\}}" | _pick_thumb_time)
+  fi
+  url="${THUMB_URL}?videoID=${vid}"
+  [[ -n "$t" ]] && url="${url}&time=${t}"
+  [[ $GENERATE -eq 1 ]] && url="${url}&generateNow=true"
+  if [[ -n "$OUT" ]]; then
+    local code
+    code=$(curl -sS --max-time 60 -o "$OUT" -w '%{http_code}' "$url" 2>/dev/null || echo 000)
+    [[ "$code" == 200 && -s "$OUT" ]] || neterr "thumbnail fetch failed (HTTP $code)"
+    echo "$OUT"
+  else
+    echo "$url"
+  fi
+}
+
+cmd_resolve() {
+  local vid="$1" body title t source url
+  body=$(_branding_json "$vid")
+  if [[ -z "$body" ]]; then
+    jq -n --arg v "$vid" '{videoId:$v, title:null, thumbnailUrl:null, source:"none"}' | _emit
+    exit 1
+  fi
+  title=$(printf '%s' "$body" | _pick_title)
+  t=$(printf '%s' "$body" | _pick_thumb_time)
+  # Derive the source from the timestamp that actually won, not from whether any
+  # community submission merely exists — a video can have community frames and
+  # still fall back to randomTime when the "original" entry outvoted them.
+  local community_t
+  community_t=$(printf '%s' "$body" | jq -r '
+    (.thumbnails // [])
+    | map(select((.removed // false) | not))
+    | map(select((.votes // 0) >= 0))
+    | sort_by([(if (.locked // false) then 1 else 0 end), (.votes // 0), (.UUID // "")])
+    | reverse | .[0]
+    | if . == null or (.original // false) then "" else ((.timestamp // "") | tostring) end')
+  if [[ -n "$community_t" ]]; then
+    source="community"
+  elif [[ -n "$t" ]]; then
+    source="randomTime"
+  else
+    source="none"
+  fi
+  url=""
+  [[ -n "$t" ]] && url="${THUMB_URL}?videoID=${vid}&time=${t}"
+  jq -n --arg v "$vid" --arg ti "$title" --arg u "$url" --arg s "$source" \
+     '{videoId:$v,
+       title:(if $ti == "" then null else $ti end),
+       thumbnailUrl:(if $u == "" then null else $u end),
+       source:$s}' | _emit
+}
+
+# --- arg parsing -----------------------------------------------------------
+
+[[ $# -eq 0 ]] && usage 2
+VERB="$1"; shift
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --api-url) API_URL="${2:-}"; [[ -z "$API_URL" ]] && die "--api-url needs a value"; shift 2 ;;
+    --raw)     RAW=1; shift ;;
+    --only)    ONLY=1; shift ;;
+    --generate) GENERATE=1; shift ;;
+    --time)    FORCE_TIME="${2:-}"; [[ -z "$FORCE_TIME" ]] && die "--time needs a value"; shift 2 ;;
+    --out)     OUT="${2:-}"; [[ -z "$OUT" ]] && die "--out needs a path"; shift 2 ;;
+    -h|--help) usage 0 ;;
+    -*)        die "unknown flag: $1" ;;
+    *)         POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+case "$VERB" in
+  -h|--help|help) usage 0 ;;
+esac
+[[ ${#POSITIONAL[@]} -ge 1 ]] || die "$VERB needs a videoId"
+VIDEO_ID="${POSITIONAL[0]}"
+[[ "$VIDEO_ID" =~ ^[A-Za-z0-9_-]{11}$ ]] || die "not a YouTube video id: $VIDEO_ID"
+
+case "$VERB" in
+  branding)      cmd_branding "$VIDEO_ID" ;;
+  branding-hash) cmd_branding_hash "$VIDEO_ID" ;;
+  hash)          cmd_hash "$VIDEO_ID" ;;
+  title)         cmd_title "$VIDEO_ID" ;;
+  thumbnail)     cmd_thumbnail "$VIDEO_ID" ;;
+  resolve)       cmd_resolve "$VIDEO_ID" ;;
+  *)             die "unknown verb: $VERB (try --help)" ;;
+esac

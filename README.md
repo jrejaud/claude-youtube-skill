@@ -5,18 +5,12 @@ no clickbait titles, a real like/dislike rating on every result, content-farm ch
 reuploads collapsed back to the original, and an actual model watching the video when you ask what
 is in it.
 
-You say *"find me a good video on replacing a bike chain"*. The agent comes back with:
+You say *"search youtube for lord of the rings"*. The agent comes back with this page (a real run):
 
-```
-| # | Title                                   | Channel             | Views | Rating | Age | Length |
-|---|-----------------------------------------|---------------------|-------|--------|-----|--------|
-| 1 | How to replace a bike chain             | Park Tool           | 2.1M  | 💚     | 4y  | 9:12   |
-| 2 | Chain replacement, quick-link method    | GCN Tech            | 640K  | 💚     | 2y  | 6:48   |
-| 3 | 10 Bike Hacks Pros Don't Want You To Know | Daily Bike Facts 🏭 | 1.4M  | 🟠     | 3w  | 8:01   |
-```
+![Results page for lord of the rings: DeArrow thumbnails, duration badges and a like-ratio pill on each video; the Rings of Power trailer shows 59% liked](docs/results-page.png)
 
-- **Title** — the [DeArrow](https://dearrow.ajay.app) community title when the uploader's is clickbait
-- **Rating** — likes vs. dislikes from [Return YouTube Dislike](https://returnyoutubedislike.com)
+- **Thumbnails and titles** — from [DeArrow](https://dearrow.ajay.app) when the uploader's are clickbait
+- **"NN% liked"** — likes vs. dislikes from [Return YouTube Dislike](https://returnyoutubedislike.com)
 - **🏭** — the channel behaves like a content farm (upload velocity, view laundering), flagged, never hidden
 - Shorts dropped, reuploads collapsed to the earliest upload, your own channel blocklist applied
 
@@ -54,7 +48,7 @@ Restart Claude Code. The skill triggers on its own whenever you mention YouTube 
 | `yt-frames` | YouTube's own auto-extracted frames, no key, no download |
 | `youtube-vision` | Gemini watches the video: `ask`, `summarize`, `key-moments` |
 | `yt-show` | Download with yt-dlp and play locally in mpv — no youtube.com, no ads |
-| `yt-grid.sh` | Thumbnail grid of the results (DeArrow thumbnails): browser contact sheet, or inline in iTerm2/kitty/WezTerm |
+| `yt-grid.sh` + `yt-page.mjs` | The results as a clean YouTube-style page: DeArrow thumbnails, like ratio, content-farm tags. Or inline thumbnails in iTerm2/kitty/WezTerm |
 | `yt-browse.sh` | fzf picker with thumbnail previews (iTerm2) |
 
 `SKILL.md` is the part Claude reads: when to fire, the exact workflow, the result format, and a

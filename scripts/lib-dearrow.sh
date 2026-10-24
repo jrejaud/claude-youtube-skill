@@ -23,7 +23,7 @@ DA_SB='https://sponsor.ajay.app/api/skipSegments'
 
 # "23:52" / "1:02:03" / "92" -> integer seconds (0 on parse failure)
 dur_to_sec() {
-  local d="${1:-}"; [[ -z "$d" || "$d" == "-" ]] && { echo 0; return; }
+  local d="${1:-}"; [[ "$d" =~ ^[0-9:]+$ ]] || { echo 0; return; }   # "-", "LIVE", "" -> 0
   local IFS=:; read -ra p <<< "$d"
   case "${#p[@]}" in
     3) echo $(( 10#${p[0]}*3600 + 10#${p[1]}*60 + 10#${p[2]} ));;

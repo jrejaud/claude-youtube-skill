@@ -37,13 +37,18 @@ Everything else (Return YouTube Dislike, DeArrow, SponsorBlock, YouTube's own fr
    ```bash
    scripts/yt-slop.sh CHANNEL_ID [CHANNEL_ID ...]   # JSONL {channel_id, flag, reasons, ...}
    ```
-5. **Present** in the table below, and **show the thumbnails**: write a TSV
-   (`videoId num title channel views approval duration age`, approval = integer percent or `-`,
-   same numbers as the table) and run
+5. **Show the results page. The page is the answer**, not a chat table: write a TSV
+   (`videoId num title channel views approval duration age farm honest`; approval = integer
+   percent liked or `-`; farm/honest = 1 or 0) and run
    ```bash
-   scripts/yt-grid.sh --tsv results.tsv            # contact sheet in the browser, DeArrow thumbnails
-   scripts/yt-grid.sh --tsv results.tsv --inline   # inline in iTerm2 / kitty / WezTerm instead
+   scripts/yt-grid.sh --tsv results.tsv --query "lord of the rings" --note "8 results · Shorts hidden"
+   scripts/yt-grid.sh --tsv results.tsv --inline   # thumbnails in the terminal instead (iTerm2 / kitty / WezTerm)
    ```
+   It writes one self-contained page (`yt-page.mjs`) that looks like YouTube with the chrome
+   stripped out: DeArrow thumbnails, duration badges, honest titles, a "NN% liked" pill per
+   video, and 🏭 on content-farm channels. Then reply in the chat with a line or two: what was
+   hidden or flagged, anything badly rated, "say a number to play it". Use the table below only
+   where no browser is available.
    When the user picks one ("play 3"), use `scripts/yt-show <id>` (see Playback).
 6. *(Opt-in, needs a real TTY + fzf)* `scripts/yt-browse.sh --tsv results.tsv` — fzf list on the
    left, DeArrow thumbnail + metadata preview on the right (iTerm2 `imgcat`), Enter plays it.
